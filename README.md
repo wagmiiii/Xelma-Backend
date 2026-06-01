@@ -58,6 +58,8 @@ The platform supports two game modes:
 - ✅ **WebSocket Support**: Live updates for prices, rounds, chat, and notifications
 - ✅ **Leaderboard System**: Tracks wins, earnings, and streaks across game modes
 - ✅ **Automated Schedulers**: Cron jobs for round creation, locking, and resolution
+- ✅ **Transactional Outbox**: Notification and WebSocket side-effects are written atomically with DB commits — guaranteed at-least-once delivery even across process crashes
+- ✅ **Dead-Letter Queue**: Failed dispatches are persisted and replayable via admin endpoints
 - ✅ **OpenAPI Documentation**: Auto-generated Swagger UI at `/api-docs`
 - ✅ **Rate Limiting**: Protects endpoints from abuse
 - ✅ **Comprehensive Logging**: Winston-based logging for debugging and monitoring
@@ -207,6 +209,12 @@ Xelma-Backend/
   - Current win streak
   - Accuracy percentage
 - **Queries**: Optimized database queries with pagination support
+- **Materialized sorted set**: When Redis is available, a Redis sorted set
+  (`ZSET`) stores every user's `totalEarnings` as the score. Rank lookups
+  become O(log N) instead of a full-table `COUNT(*)`. The set is kept in sync
+  after every `updateUserStatsForRound` call and invalidated whenever the
+  leaderboard namespace is flushed. The DB path is always the fallback when
+  Redis is unavailable.
 
 #### **7. WebSocket Service (`websocket.service.ts`)**
 - **Purpose**: Broadcasts real-time events to connected clients
@@ -230,6 +238,15 @@ Xelma-Backend/
 > disabled. This is the recommended setup for split deployments — one
 > dedicated worker process runs background jobs while one or more
 > stateless processes serve HTTP — and for safer local debugging.
+
+#### **8a. Outbox Service (`outbox.service.ts`)** — Issue #18
+- **Purpose**: Guarantees at-least-once delivery of notification and WebSocket side-effects
+- **How it works**:
+  1. Business transactions (payout, prediction) write `OutboxEvent` rows *inside* the same `prisma.$transaction()` call — atomically with the state change.
+  2. A background poller (cron, every `OUTBOX_POLL_INTERVAL_SECONDS`) reads `PENDING` rows and dispatches them.
+  3. On success the row is marked `PROCESSED`. On failure `attempts` is incremented; once `OUTBOX_MAX_ATTEMPTS` is reached the row is marked `FAILED` and escalated to the existing DLQ.
+- **Why this matters**: Before this change, notifications fired *after* the transaction committed. A process crash between commit and notification call silently dropped the event. Now the event is durable from the moment the transaction commits.
+- **Env vars**: `OUTBOX_POLL_INTERVAL_SECONDS`, `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_RETENTION_DAYS`
 
 #### **9. Notification Service (`notification.service.ts`)**
 - **Purpose**: Creates and delivers notifications to users
